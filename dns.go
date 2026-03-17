@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"strings"
 	"sync"
@@ -112,35 +113,48 @@ func NewDNSResolver() *DNSResolver {
 }
 
 // DetectDomainCDN 主检测入口
-func (r *DNSResolver) DetectDomainCDN(ctx context.Context, domain string) (bool,string, error) {
+func (r *DNSResolver) DetectDomainCDN(ctx context.Context, domain string) (bool, string, error) {
 	result := &CheckResult{}
 
-	// 并行执行两种检测
 	var wg sync.WaitGroup
+	var mu sync.Mutex // 修复1：增加互斥锁防止 Data Race
 	wg.Add(2)
 
 	// 1. 全球DNS解析
 	go func() {
 		defer wg.Done()
 		ips, names, _ := r.globalDNSResolution(ctx, domain)
-		result.IPs = ips
-		result.CNAMETargets = names
+		
+		mu.Lock()
+		result.IPs = append(result.IPs, ips...)
+		result.CNAMETargets = append(result.CNAMETargets, names...)
+		mu.Unlock()
 	}()
 
 	// 2. CNAME检测
 	go func() {
 		defer wg.Done()
-		if names, _ := r.resolveCNAMEChain(domain); len(names) > 0 {
-			result.CNAMETargets = names
+		// 修复2：传入 ctx 进行超时控制
+		if names, _ := r.resolveCNAMEChain(ctx, domain); len(names) > 0 {
+			mu.Lock()
+			result.CNAMETargets = append(result.CNAMETargets, names...)
+			mu.Unlock()
 		}
 	}()
 
 	wg.Wait()
+
+	// 修复3：对合并后的结果进行去重
+	result.IPs = deduplicateIPs(result.IPs)
+	result.CNAMETargets = deduplicateStrs(result.CNAMETargets)
+
 	r.analyzeResults(result)
+
+	// 保留你原本的特殊逻辑
 	if len(result.IPs) == 0 {
-	    return true, "xx",nil
+		return true, "xx", nil
 	}
-	return result.IsCDN,result.IPs[0].String(), nil
+	return result.IsCDN, result.IPs[0].String(), nil
 }
 
 // 全球DNS解析（并发查询）
@@ -163,10 +177,11 @@ func (r *DNSResolver) globalDNSResolution(ctx context.Context, domain string) ([
 			msg := dns.Msg{}
 			msg.SetQuestion(dns.Fqdn(domain), dns.TypeA)
 
-			ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			// 子查询的超时控制
+			subCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 			defer cancel()
 
-			response, _, err := r.client.ExchangeContext(ctx, &msg, srv)
+			response, _, err := r.client.ExchangeContext(subCtx, &msg, srv)
 			if err != nil || response == nil {
 				return
 			}
@@ -192,11 +207,11 @@ func (r *DNSResolver) globalDNSResolution(ctx context.Context, domain string) ([
 	}
 
 	wg.Wait()
-	return deduplicateIPs(ips), names, nil
+	return ips, names, nil // 外层已经有去重逻辑，这里直接返回即可
 }
 
 // 递归解析CNAME链
-func (r *DNSResolver) resolveCNAMEChain(domain string) ([]string, error) {
+func (r *DNSResolver) resolveCNAMEChain(ctx context.Context, domain string) ([]string, error) {
 	var names []string
 	visited := make(map[string]bool)
 
@@ -209,7 +224,8 @@ func (r *DNSResolver) resolveCNAMEChain(domain string) ([]string, error) {
 		msg := dns.Msg{}
 		msg.SetQuestion(dns.Fqdn(domain), dns.TypeCNAME)
 
-		response, _, err := r.client.Exchange(&msg, r.selectOptimalDNS())
+		// 修复4：使用 ExchangeContext 代替 Exchange，确保受控于传入的 ctx
+		response, _, err := r.client.ExchangeContext(ctx, &msg, r.selectOptimalDNS())
 		if err != nil || response == nil {
 			break
 		}
@@ -232,7 +248,9 @@ func (r *DNSResolver) resolveCNAMEChain(domain string) ([]string, error) {
 
 // 智能选择DNS服务器
 func (r *DNSResolver) selectOptimalDNS() string {
-	return r.dnsServers[time.Now().Unix()%int64(len(r.dnsServers))]
+	// 修复5：使用 math/rand 配合时间戳纳秒级随机数种子，实现真正的随机负载均衡
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	return r.dnsServers[rng.Intn(len(r.dnsServers))]
 }
 
 // 结果分析逻辑（精简版）
@@ -256,6 +274,7 @@ func (r *DNSResolver) analyzeResults(result *CheckResult) {
 }
 
 // 工具函数
+
 func containsIP(ips []net.IP, ip net.IP) bool {
 	for _, existing := range ips {
 		if existing.Equal(ip) {
@@ -265,19 +284,6 @@ func containsIP(ips []net.IP, ip net.IP) bool {
 	return false
 }
 
-func deduplicateIPs(ips []net.IP) []net.IP {
-	seen := make(map[string]bool)
-	var result []net.IP
-	for _, ip := range ips {
-		key := ip.String()
-		if !seen[key] {
-			seen[key] = true
-			result = append(result, ip)
-		}
-	}
-	return result
-}
-
 func containsStr(slice []string, s string) bool {
 	for _, item := range slice {
 		if item == s {
@@ -285,4 +291,31 @@ func containsStr(slice []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// 修复6：优化去重性能，采用 map[string]struct{} 降低内存开销
+func deduplicateIPs(ips []net.IP) []net.IP {
+	seen := make(map[string]struct{})
+	var result []net.IP
+	for _, ip := range ips {
+		key := ip.String()
+		if _, exists := seen[key]; !exists {
+			seen[key] = struct{}{}
+			result = append(result, ip)
+		}
+	}
+	return result
+}
+
+// 新增：用于去重 CNAME 的工具函数
+func deduplicateStrs(strs []string) []string {
+	seen := make(map[string]struct{})
+	var result []string
+	for _, s := range strs {
+		if _, exists := seen[s]; !exists {
+			seen[s] = struct{}{}
+			result = append(result, s)
+		}
+	}
+	return result
 }
